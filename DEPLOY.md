@@ -104,18 +104,18 @@ This registers PM2 as a Windows Service that starts automatically on reboot.
 | `ANGEL_PASSWORD` | Angel One login password | `yourpassword` |
 | `ANGEL_TOTP_SECRET` | TOTP secret (base32) for 2FA | `JBSWY3DPEHPK3PXP` |
 | `FIREBASE_SERVICE_ACCOUNT` | Path to Firebase service account JSON | `./firebase-service-account.json` |
-| `PORT` | Port the server listens on | `3001` |
+| `PORT` | Port the server listens on | `3002` |
 | `ALLOWED_ORIGINS` | Comma-separated CORS origins | `https://yourapp.com` |
 | `BROADCAST_INTERVAL_MS` | Price broadcast interval in ms | `1000` |
 | `MARKET_OPEN_HOUR` | Market open hour (IST, 24h) | `9` |
 | `MARKET_OPEN_MINUTE` | Market open minute (IST) | `15` |
 | `MARKET_CLOSE_HOUR` | Market close hour (IST, 24h) | `15` |
 | `MARKET_CLOSE_MINUTE` | Market close minute (IST) | `30` |
-| `PRICE_SERVER_URL` | Public URL of this server (used by Firebase Functions) | `http://31.172.87.141:3001` |
+| `PRICE_SERVER_URL` | Public URL of this server (used by Firebase Functions) | `http://31.172.87.141:3002` |
 
 ---
 
-## Windows Firewall — open port 3001
+## Windows Firewall — open port 3002
 
 Run in PowerShell as Administrator:
 
@@ -123,7 +123,7 @@ Run in PowerShell as Administrator:
 New-NetFirewallRule -DisplayName "Algo Price Server" `
   -Direction Inbound `
   -Protocol TCP `
-  -LocalPort 3001 `
+  -LocalPort 3002 `
   -Action Allow
 ```
 
@@ -173,7 +173,7 @@ pm2 monit                         # real-time CPU/memory dashboard
 Once running, verify the server is up:
 
 ```
-http://YOUR_SERVER_IP:3001/health
+http://YOUR_SERVER_IP:3002/health
 ```
 
 Expected response:
@@ -195,12 +195,12 @@ Broker will show `"connected"` during NSE market hours (Mon–Fri, 9:15 AM–3:3
 In your Flutter project, set the `PRICE_SERVER_URL` build argument:
 
 ```bash
-flutter run --dart-define=PRICE_SERVER_URL=http://YOUR_SERVER_IP:3001
+flutter run --dart-define=PRICE_SERVER_URL=http://YOUR_SERVER_IP:3002
 ```
 
 Or in your Flutter CI/CD build config:
 ```
---dart-define=PRICE_SERVER_URL=http://31.172.87.141:3001
+--dart-define=PRICE_SERVER_URL=http://31.172.87.141:3002
 ```
 
 ---
@@ -209,5 +209,5 @@ Or in your Flutter CI/CD build config:
 
 - **Never commit `.env` or `firebase-service-account.json`** — both are in `.gitignore`
 - Run the server behind a **reverse proxy (nginx/IIS)** with HTTPS in production
-- Restrict port 3001 in the firewall to only your app's IP if possible
+- Restrict port 3002 in the firewall to only your app's IP if possible
 - Rotate your Angel One TOTP secret and API key if they're ever exposed

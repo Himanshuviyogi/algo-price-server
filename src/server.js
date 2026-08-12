@@ -51,7 +51,7 @@ app.use((req, res, next) => {
 
 // ── Admin panel static files ──────────────────────────────────────────────────
 // Serves the built admin panel from /admin — same origin as price server,
-// so no mixed content issues when calling http://31.172.87.141:3001
+// so no mixed content issues when calling http://31.172.87.141:3002
 const adminDist = path.join(__dirname, '../admin-dist');
 const fs = require('fs');
 if (fs.existsSync(adminDist)) {

@@ -35,7 +35,7 @@ module.exports = {
       // PM2 will load .env automatically when env_file is set.
       env: {
         NODE_ENV: 'production',
-        PORT: 3001,
+        PORT: 3002,
       },
 
       // ── Windows-specific ──────────────────────────────────────────────────
