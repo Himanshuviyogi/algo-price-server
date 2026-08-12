@@ -1,0 +1,28 @@
+# ── Dependencies ──────────────────────────────────────────────────────────────
+node_modules/
+
+# ── Secrets — NEVER commit these ──────────────────────────────────────────────
+.env
+*.env
+firebase-service-account.json
+serviceAccount*.json
+*-service-account.json
+credentials.json
+
+# ── Logs ──────────────────────────────────────────────────────────────────────
+logs/
+*.log
+npm-debug.log*
+pm2-*.log
+
+# ── PM2 runtime ───────────────────────────────────────────────────────────────
+.pm2/
+
+# ── OS / Editor ───────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# ── Admin panel build (built on server, not committed) ────────────────────────
+admin-dist/
