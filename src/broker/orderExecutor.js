@@ -237,13 +237,40 @@ async function _requestForUser(userId, method, path, data = null) {
   }
 }
 
+// ── Paper trading ─────────────────────────────────────────────────────────────
+// When app_config/algo_risk.paper_trading === true, all order placement calls
+// are short-circuited: no real order reaches Angel One.
+// Instead we write a synthetic 'complete' order to Firestore so the entire
+// app pipeline (position monitor, P&L tracking, notifications) runs normally.
+//
+// Cache the flag for 60 seconds so every placeOrder call doesn't hit Firestore.
+
+let _paperTradingCache = { value: false, expiresAt: 0 };
+
+async function _isPaperTrading() {
+  if (Date.now() < _paperTradingCache.expiresAt) return _paperTradingCache.value;
+
+  try {
+    const snap = await admin.firestore()
+      .collection('app_config').doc('algo_risk').get();
+    const val = snap.data()?.paper_trading === true;
+    _paperTradingCache = { value: val, expiresAt: Date.now() + 60_000 };
+    return val;
+  } catch {
+    return false; // fail open — don't block real trading on a Firestore error
+  }
+}
+
+/** Force the paper trading cache to re-read on the next call. */
+function invalidatePaperTradingCache() {
+  _paperTradingCache.expiresAt = 0;
+}
+
 // ── Firestore helper ──────────────────────────────────────────────────────────
 
 function _db() {
   return admin.firestore();
 }
-
-// ── placeOrder ────────────────────────────────────────────────────────────────
 
 /**
  * Place a new order on Angel One using the *user's own* credentials.
@@ -271,6 +298,7 @@ async function placeOrder({
   triggerPrice = 0,
   userId,
   signalId = null,
+  paperTrade = false,    // caller can force paper mode per-order
 }) {
   if (!symbol || !exchange || !action || !orderType || !quantity || !userId) {
     throw new Error('placeOrder: missing required fields');
@@ -327,6 +355,27 @@ async function placeOrder({
 
   // ── Call Angel One with user's own session ────────────────────────────────
   try {
+    // ── PAPER TRADING SHORT-CIRCUIT ───────────────────────────────────────
+    // When paper_trading is enabled globally OR caller passed paperTrade:true,
+    // skip Angel One entirely.
+    // Writes a synthetic 'complete' order so the rest of the pipeline
+    // (position monitor, P&L, notifications) works exactly as in live mode.
+    if (paperTrade || (await _isPaperTrading())) {
+      const paperOrderId = `PAPER-${Date.now()}-${Math.random().toString(36).slice(2, 8).toUpperCase()}`;
+      await orderRef.update({
+        angel_order_id: paperOrderId,
+        status:         'complete',
+        paper_trade:    true,
+        updated_at:     admin.firestore.Timestamp.fromDate(new Date()),
+      });
+      console.log(
+        `[OrderExecutor] 📄 PAPER TRADE for user ${userId}: ` +
+        `${action} ${quantity} ${symbol} — paperId=${paperOrderId} firestoreId=${firestoreOrderId}`
+      );
+      return { success: true, angelOrderId: paperOrderId, firestoreOrderId, paperTrade: true };
+    }
+    // ─────────────────────────────────────────────────────────────────────
+
     const payload = {
       variety:         'NORMAL',
       tradingsymbol:   symbol.toUpperCase(),
@@ -446,6 +495,22 @@ async function cancelOrder({ angelOrderId, userId }) {
     orderid: String(angelOrderId),
   };
 
+  // Paper trading: skip Angel One, just update Firestore status
+  if (await _isPaperTrading()) {
+    try {
+      const snap = await _db().collection('orders')
+        .where('angel_order_id', '==', String(angelOrderId)).limit(1).get();
+      if (!snap.empty) {
+        await snap.docs[0].ref.update({
+          status:     'cancelled',
+          updated_at: admin.firestore.Timestamp.fromDate(new Date()),
+        });
+      }
+    } catch { /* ignore */ }
+    console.log(`[OrderExecutor] 📄 PAPER cancel: ${angelOrderId} (user ${userId})`);
+    return { success: true, angelOrderId };
+  }
+
   await _requestForUser(userId, 'POST', '/rest/secure/angelbroking/order/v1/cancelOrder', payload);
 
   try {
@@ -552,4 +617,5 @@ module.exports = {
   cancelOrder,
   getOrderStatus,
   syncOrderBook,
+  invalidatePaperTradingCache,
 };

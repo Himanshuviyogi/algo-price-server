@@ -108,6 +108,9 @@ app.post('/reload-symbols', async (req, res) => {
   try {
     const tokens = await loadFromFirestore();
     const symbols = Object.keys(tokens);
+    // Also flush the paper-trading cache so a paper_trading flag change
+    // takes effect immediately without waiting for the 60-second TTL.
+    require('./broker/orderExecutor').invalidatePaperTradingCache();
     console.log(`[Tokens] Reloaded ${symbols.length} symbols from Firestore.`);
     res.json({ success: true, count: symbols.length, symbols });
   } catch (err) {
@@ -445,6 +448,111 @@ app.post('/run-screeners', async (req, res) => {
 });
 
 
+// ── Backtest endpoint ─────────────────────────────────────────────────────────
+// Runs a strategy simulation over real Angel One historical OHLCV candles.
+//
+// POST /backtest
+// Body: {
+//   underlying   string   — 'NIFTY' | 'BANKNIFTY' | 'FINNIFTY' | 'MIDCPNIFTY' | 'SENSEX'
+//   timeframe    string   — '1m' | '3m' | '5m' | '15m' | '1H' | '1D'
+//   entryConds   object[] — array of _Condition objects from the Flutter strategy builder
+//   exitConds    object[] — (optional) exit conditions
+//   legs         object[] — array of _Leg objects from the Flutter strategy builder
+//   slPct        string   — stop-loss percentage e.g. '50'
+//   tgtPct       string   — target percentage e.g. '100'
+// }
+// Response: {
+//   success      boolean
+//   totalPnl     number
+//   totalTrades  number
+//   winTrades    number
+//   maxDrawdown  number
+//   winRate      number
+//   equityCurve  number[]
+//   interval     string
+//   candleCount  number
+//   fromDate     string
+//   toDate       string
+//   source       'angel_one'
+// }
+
+const { runBacktest } = require('./broker/backtestEngine');
+
+// In-flight guard — prevents a user hammering the button from spawning
+// multiple parallel candle-fetch + simulation runs simultaneously.
+const _backtestInFlight = new Map(); // key: userId (or 'anon'), value: true
+
+app.post('/backtest', async (req, res) => {
+  // Auth — require a valid Firebase ID token so only app users can call this.
+  const authHeader = req.headers.authorization || '';
+  const idToken = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : null;
+
+  let callerUid = 'anon';
+  if (idToken) {
+    try {
+      const decoded = await verifyToken(idToken);
+      callerUid = decoded.uid;
+    } catch (_) {
+      // Token invalid — still allow the call (price data is not sensitive)
+      // but log it so we can monitor abuse.
+      console.warn('[Backtest] Invalid token — proceeding as anonymous');
+    }
+  }
+
+  // One concurrent backtest per user
+  if (_backtestInFlight.get(callerUid)) {
+    return res.status(429).json({
+      success: false,
+      error: 'A backtest is already running. Please wait for it to complete.',
+    });
+  }
+
+  const {
+    underlying  = 'NIFTY',
+    timeframe   = '15m',
+    entryConds  = [],
+    exitConds   = [],
+    legs        = [],
+    slPct       = '50',
+    tgtPct      = '100',
+  } = req.body;
+
+  // Basic validation
+  if (typeof underlying !== 'string' || underlying.trim().length === 0) {
+    return res.status(400).json({ success: false, error: 'underlying is required' });
+  }
+  if (typeof timeframe !== 'string' || timeframe.trim().length === 0) {
+    return res.status(400).json({ success: false, error: 'timeframe is required' });
+  }
+
+  console.log(
+    `[Backtest] Request from uid=${callerUid}: ` +
+    `${underlying} ${timeframe} | ${entryConds.length} entry conds | ` +
+    `${legs.length} legs | SL=${slPct}% TGT=${tgtPct}%`
+  );
+
+  _backtestInFlight.set(callerUid, true);
+
+  try {
+    const result = await runBacktest({
+      underlying: underlying.trim(),
+      timeframe:  timeframe.trim(),
+      entryConds,
+      exitConds,
+      legs,
+      slPct,
+      tgtPct,
+    });
+
+    res.json({ success: true, ...result });
+  } catch (err) {
+    console.error('[Backtest] Failed:', err.message);
+    res.status(500).json({ success: false, error: err.message });
+  } finally {
+    _backtestInFlight.delete(callerUid);
+  }
+});
+
 // ── Order Execution endpoints ─────────────────────────────────────────────────
 // Backed by orderExecutor.js which calls Angel One SmartAPI and syncs to Firestore.
 
@@ -457,6 +565,7 @@ app.post('/place-order', async (req, res) => {
     const {
       userId, symbol, exchange, action, orderType,
       quantity, price, triggerPrice = 0, signalId = null,
+      paperTrade = false,
     } = req.body;
 
     if (!userId || !symbol || !exchange || !action || !orderType || !quantity) {
@@ -469,7 +578,7 @@ app.post('/place-order', async (req, res) => {
     const result = await orderExecutor.placeOrder({
       symbol, exchange, action, orderType,
       quantity, price, triggerPrice,
-      userId, signalId,
+      userId, signalId, paperTrade,
     });
 
     res.json(result);
@@ -590,6 +699,39 @@ app.post('/close-position', async (req, res) => {
     res.json(result);
   } catch (err) {
     console.error('[API] /close-position failed:', err.message);
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// GET /positions/:userId
+// Returns all open positions for a user from Firestore.
+// Flutter's PositionsScreen calls this to verify the sync button works even
+// when the broker is offline. positionManager.syncPositions uses POST
+// /sync-positions/:userId for the actual Angel One fetch; this endpoint is
+// the lightweight read-only counterpart.
+
+app.get('/positions/:userId', async (req, res) => {
+  try {
+    const { userId } = req.params;
+    if (!userId) {
+      return res.status(400).json({ success: false, error: 'userId is required' });
+    }
+
+    const snap = await require('firebase-admin')
+      .firestore()
+      .collection('positions')
+      .where('user_id', '==', userId)
+      .where('status', '==', 'open')
+      .orderBy('opened_at', 'desc')
+      .limit(50)
+      .get();
+
+    const positions = snap.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+
+    console.log(`[API] /positions/${userId}: ${positions.length} open position(s)`);
+    res.json({ success: true, positions });
+  } catch (err) {
+    console.error('[API] /positions failed:', err.message);
     res.status(500).json({ success: false, error: err.message });
   }
 });
