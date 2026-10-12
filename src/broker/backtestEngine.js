@@ -101,6 +101,13 @@ function _dateRange(interval, range = '3 Months') {
   };
   const requestedDays = RANGE_DAYS[range.toLowerCase()] ?? 90;
 
+  // For daily/hourly intervals enforce a minimum so EMA(50) has enough bars
+  const MIN_DAYS = {
+    'ONE_DAY':  180,  // ~126 trading days — enough for EMA(50) + warmup
+    'ONE_HOUR': 90,
+  };
+  const minDays = MIN_DAYS[interval] ?? 0;
+
   // Angel One per-interval hard caps (slightly under their documented limits)
   const MAX_DAYS = {
     'ONE_MINUTE':     25,
@@ -112,8 +119,8 @@ function _dateRange(interval, range = '3 Months') {
     'ONE_HOUR':       365,
     'ONE_DAY':        730,
   };
-  const maxDays = MAX_DAYS[interval] ?? 180;
-  const actualDays = Math.min(requestedDays, maxDays);
+  const maxDays    = MAX_DAYS[interval] ?? 180;
+  const actualDays = Math.min(Math.max(requestedDays, minDays), maxDays);
 
   from.setDate(from.getDate() - actualDays);
 
@@ -726,6 +733,26 @@ function _simulateTrade({ legs, action = 'BUY', shares = 1, entryClose, lotSize,
   }
 }
 
+// ── Max indicator period helper ───────────────────────────────────────────────
+// Scans all conditions and returns the largest period value so the warmup
+// skips enough bars for every indicator to be fully initialised.
+function _maxIndicatorPeriod(entryConds = [], exitConds = []) {
+  let max = 20; // baseline
+  const allConds = [...entryConds, ...exitConds];
+  for (const rawCond of allConds) {
+    const c = _normCond(rawCond);
+    const a = parseInt(c.paramA)    || 0;
+    const b = parseInt(c.paramB)    || 0;
+    const r = parseInt(c.rhsPeriod) || 0;
+    if (a > max) max = a;
+    if (b > max) max = b;
+    if (r > max) max = r;
+    // MACD slow period default is 26 — if indicator is MACD and paramB empty, use 26
+    if (c.indicator === 'MACD' && b === 0 && 26 > max) max = 26;
+  }
+  return max;
+}
+
 // ── Main backtest runner ──────────────────────────────────────────────────────
 
 /**
@@ -783,9 +810,24 @@ async function runBacktest(params) {
   const cache  = { closes, candles }; // lazy: indicator arrays computed on first access
 
   // ── Warm-up period: skip the first N bars ─────────────────────────────────
-  // 200 is a safe upper bound for any indicator period used in conditions.
-  // This avoids false signals before indicators are warmed up.
-  const WARMUP = Math.min(200, Math.floor(candles.length * 0.15));
+  // Must cover the longest indicator period in the entry conditions so we
+  // don't get null values on the first evaluated bar.
+  // Daily strategies with EMA(50) need at least 50 bars of warmup.
+  const maxPeriod = _maxIndicatorPeriod(entryConds, exitConds);
+  const WARMUP    = Math.min(
+    Math.floor(candles.length * 0.35),  // never burn more than 35% of data
+    Math.max(maxPeriod + 5, 20)         // at least max-period + 5 buffer bars
+  );
+
+  // Guard: if warmup consumes too much data, abort with a clear message
+  if (WARMUP >= candles.length - 10) {
+    const needed = maxPeriod + 15;
+    throw new Error(
+      `Not enough candle data for this strategy. The longest indicator period ` +
+      `is ${maxPeriod}, which needs at least ${needed} bars, but only ` +
+      `${candles.length} were returned. Try a longer date range or higher timeframe.`
+    );
+  }
 
   // ── Trade simulation state ─────────────────────────────────────────────────
   let inTrade       = false;
