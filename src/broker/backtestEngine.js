@@ -21,9 +21,11 @@
 
 'use strict';
 
-const axios    = require('axios');
-const config   = require('../config');
-const angelOne = require('./angelOne');
+const axios          = require('axios');
+const config         = require('../config');
+const angelOne       = require('./angelOne');
+const { getInstrument } = require('./instrumentTokens');
+const { loadScripMaster } = require('./scripMaster');
 
 const ANGEL_BASE = 'https://apiconnect.angelone.in';
 
@@ -138,9 +140,46 @@ function _dateRange(interval, range = '3 Months') {
  * @returns {Promise<Array<{ time, open, high, low, close, volume }>>}
  */
 async function _fetchCandles(underlying, interval, range = '3 Months') {
-  const inst = INDEX_TOKENS[underlying.toUpperCase()];
+  const sym = underlying.toUpperCase();
+
+  // ── Resolve instrument token ─────────────────────────────────────────────
+  // 1. Check INDEX_TOKENS (NSE/BSE indices — use dedicated historical tokens)
+  // 2. Fall back to instrumentTokens.js (Firestore + hardcoded stock map)
+  // 3. Last resort: search ScripMaster for the NSE EQ token
+
+  let inst = INDEX_TOKENS[sym];
+
   if (!inst) {
-    throw new Error(`Unknown underlying "${underlying}". Supported: ${Object.keys(INDEX_TOKENS).join(', ')}`);
+    // Try the shared instrumentTokens map (covers ~25 liquid stocks + MCX)
+    const it = getInstrument(sym);
+    if (it) {
+      inst = { token: it.token, exchange: it.exchange };
+    }
+  }
+
+  if (!inst) {
+    // Last resort — scan Angel One ScripMaster for an exact NSE EQ match
+    try {
+      const master   = await loadScripMaster();
+      const match    = master.find(
+        r => r.symbol && r.symbol.toUpperCase() === sym && r.exch_seg === 'NSE' &&
+             (!r.instrumenttype || r.instrumenttype === '' || r.instrumenttype === 'EQ')
+      );
+      if (match) {
+        inst = { token: String(match.token), exchange: 'NSE' };
+        console.log(`[Backtest] Resolved ${sym} → token ${inst.token} via ScripMaster`);
+      }
+    } catch (smErr) {
+      console.warn('[Backtest] ScripMaster lookup failed:', smErr.message);
+    }
+  }
+
+  if (!inst) {
+    throw new Error(
+      `Unknown underlying "${underlying}". ` +
+      `Supported indices: ${Object.keys(INDEX_TOKENS).join(', ')}. ` +
+      `For stocks, ensure the symbol matches the NSE ticker exactly (e.g. HDFCBANK, RELIANCE).`
+    );
   }
 
   let authToken = angelOne.getAuthToken();
