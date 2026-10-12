@@ -515,6 +515,9 @@ app.post('/backtest', async (req, res) => {
     legs        = [],
     slPct       = '50',
     tgtPct      = '100',
+    range       = '3 Months',
+    action      = 'BUY',
+    shares      = 10,
   } = req.body;
 
   // Basic validation
@@ -527,7 +530,7 @@ app.post('/backtest', async (req, res) => {
 
   console.log(
     `[Backtest] Request from uid=${callerUid}: ` +
-    `${underlying} ${timeframe} | ${entryConds.length} entry conds | ` +
+    `${underlying} ${timeframe} range=${range} | ${entryConds.length} entry conds | ` +
     `${legs.length} legs | SL=${slPct}% TGT=${tgtPct}%`
   );
 
@@ -542,6 +545,9 @@ app.post('/backtest', async (req, res) => {
       legs,
       slPct,
       tgtPct,
+      range,
+      action,
+      shares: parseInt(shares) || 10,
     });
 
     res.json({ success: true, ...result });

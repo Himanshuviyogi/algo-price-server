@@ -80,46 +80,40 @@ function _fmtIst(d) {
 
 /**
  * Build Angel One date range for the requested lookback.
- * Returns { fromdate, todate } strings in "YYYY-MM-DD HH:MM" IST format.
- *
- * Angel One maximum candle limits per interval:
- *   ONE_MINUTE       → max 30 days
- *   THREE_MINUTE     → max 60 days
- *   FIVE_MINUTE      → max 100 days
- *   FIFTEEN_MINUTE   → max 200 days
- *   ONE_HOUR / ONE_DAY → max 2 years
- *
- * We cap at 180 calendar days (~6 months) for intraday intervals to keep
- * response sizes manageable and stay within Angel One's limits.
+ * Now honours the 'range' string from Flutter (e.g. '1 Month', '3 Months',
+ * '6 Months', '1 Year', '2 Years') while still capping at Angel One's per-interval limits.
  *
  * @param {string} interval - Angel One interval string
+ * @param {string} range    - human-readable period from Flutter UI
  * @returns {{ fromdate: string, todate: string }}
  */
-function _dateRange(interval) {
+function _dateRange(interval, range = '3 Months') {
   const now  = new Date();
   const from = new Date(now);
 
-  switch (interval) {
-    case 'ONE_MINUTE':
-      from.setDate(from.getDate() - 25);    // stay under 30-day cap
-      break;
-    case 'THREE_MINUTE':
-      from.setDate(from.getDate() - 55);
-      break;
-    case 'FIVE_MINUTE':
-    case 'TEN_MINUTE':
-      from.setDate(from.getDate() - 90);
-      break;
-    case 'FIFTEEN_MINUTE':
-    case 'THIRTY_MINUTE':
-      from.setDate(from.getDate() - 180);
-      break;
-    case 'ONE_HOUR':
-    case 'ONE_DAY':
-    default:
-      from.setFullYear(from.getFullYear() - 1); // 1 year for daily/hourly
-      break;
-  }
+  // Parse the range string into a requested number of calendar days
+  const RANGE_DAYS = {
+    '1 month':  30,  '1 months':  30,
+    '3 months': 90,  '6 months': 180,
+    '1 year':  365,  '2 years':  730,
+  };
+  const requestedDays = RANGE_DAYS[range.toLowerCase()] ?? 90;
+
+  // Angel One per-interval hard caps (slightly under their documented limits)
+  const MAX_DAYS = {
+    'ONE_MINUTE':     25,
+    'THREE_MINUTE':   55,
+    'FIVE_MINUTE':    90,
+    'TEN_MINUTE':     90,
+    'FIFTEEN_MINUTE': 180,
+    'THIRTY_MINUTE':  180,
+    'ONE_HOUR':       365,
+    'ONE_DAY':        730,
+  };
+  const maxDays = MAX_DAYS[interval] ?? 180;
+  const actualDays = Math.min(requestedDays, maxDays);
+
+  from.setDate(from.getDate() - actualDays);
 
   // fromdate: market open (09:15)   todate: market close (15:30)
   const fromDate = new Date(from);
@@ -143,13 +137,12 @@ function _dateRange(interval) {
  * @param {string} interval   - Angel One interval constant
  * @returns {Promise<Array<{ time, open, high, low, close, volume }>>}
  */
-async function _fetchCandles(underlying, interval) {
+async function _fetchCandles(underlying, interval, range = '3 Months') {
   const inst = INDEX_TOKENS[underlying.toUpperCase()];
   if (!inst) {
     throw new Error(`Unknown underlying "${underlying}". Supported: ${Object.keys(INDEX_TOKENS).join(', ')}`);
   }
 
-  // Ensure we have an auth token — try server's own session first
   let authToken = angelOne.getAuthToken();
   if (!authToken) {
     console.log('[Backtest] No active auth token — logging in...');
@@ -157,7 +150,7 @@ async function _fetchCandles(underlying, interval) {
     authToken = session.authToken;
   }
 
-  const { fromdate, todate } = _dateRange(interval);
+  const { fromdate, todate } = _dateRange(interval, range);
 
   console.log(`[Backtest] Fetching ${interval} candles for ${underlying} (${fromdate} → ${todate})`);
 
@@ -302,6 +295,27 @@ function _rsiArray(closes, period = 14) {
  * @param {object}  candle      - current OHLCV candle
  * @returns {number|null}
  */
+// ── Normalise a condition object — handle both snake_case (from Flutter toMap)
+// and camelCase (legacy) field names so both work transparently.
+// ─────────────────────────────────────────────────────────────────────────────
+function _normCond(c) {
+  return {
+    lhsType:   c.lhs_type        || c.lhsType        || 'Indicator',
+    indicator: c.indicator       || '',
+    lhsPrice:  c.lhs_price       || c.lhsPrice        || 'Close',
+    paramA:    c.param_a         || c.paramA          || '14',
+    paramB:    c.param_b         || c.paramB          || '14',
+    paramC:    c.param_c         || c.paramC          || '9',
+    candleSrc: c.candle_src      || c.candleSrc       || 'Current Candle',
+    op:        c.operator        || c.op              || '>',
+    rhsIsInd:  c.rhs_is_indicator != null ? c.rhs_is_indicator : (c.rhsIsInd || false),
+    valueA:    c.value_a         || c.valueA          || '0',
+    valueB:    c.value_b         || c.valueB          || '',
+    rhsPeriod: c.rhs_period      || c.rhsPeriod       || '14',
+    logic:     c.logic           || 'AND',
+  };
+}
+
 function _indValue(indicator, paramA, cache, i, candle) {
   const period = parseInt(paramA) || 14;
 
@@ -321,27 +335,182 @@ function _indValue(indicator, paramA, cache, i, candle) {
       if (!cache[key]) cache[key] = _rsiArray(cache.closes, period);
       return cache[key][i];
     }
+    case 'VWAP': {
+      // VWAP: cumulative (close × volume) / cumulative volume, reset per day
+      if (!cache.vwap) {
+        const v = new Array(cache.closes.length).fill(null);
+        let cumTpv = 0, cumVol = 0, lastDay = null;
+        for (let j = 0; j < cache.candles.length; j++) {
+          const cn = cache.candles[j];
+          const day = new Date(cn.time).toDateString();
+          if (day !== lastDay) { cumTpv = 0; cumVol = 0; lastDay = day; }
+          const tp  = (cn.high + cn.low + cn.close) / 3;
+          cumTpv += tp * cn.volume;
+          cumVol += cn.volume;
+          v[j] = cumVol > 0 ? cumTpv / cumVol : cn.close;
+        }
+        cache.vwap = v;
+      }
+      return cache.vwap[i];
+    }
+    case 'MACD': {
+      // MACD line = EMA(fast) - EMA(slow). paramA = fast (12), paramB handled in caller.
+      const fast = period;   // from paramA
+      const slow = 26;       // standard default — caller passes paramB separately
+      const keyM = `macd_${fast}_${slow}`;
+      if (!cache[keyM]) {
+        const emaFast = _emaArray(cache.closes, fast);
+        const emaSlow = _emaArray(cache.closes, slow);
+        cache[keyM] = cache.closes.map((_, j) =>
+          emaFast[j] != null && emaSlow[j] != null ? emaFast[j] - emaSlow[j] : null
+        );
+      }
+      return cache[keyM][i];
+    }
+    case 'ATR': {
+      const key = `atr_${period}`;
+      if (!cache[key]) {
+        const atr = new Array(cache.candles.length).fill(null);
+        const trs = cache.candles.map((cn, j) => {
+          if (j === 0) return cn.high - cn.low;
+          const prev = cache.candles[j - 1].close;
+          return Math.max(cn.high - cn.low, Math.abs(cn.high - prev), Math.abs(cn.low - prev));
+        });
+        // Wilder smooth
+        let sum = 0;
+        for (let j = 0; j < period && j < trs.length; j++) sum += trs[j];
+        if (trs.length >= period) atr[period - 1] = sum / period;
+        for (let j = period; j < trs.length; j++) {
+          atr[j] = (atr[j - 1] * (period - 1) + trs[j]) / period;
+        }
+        cache[key] = atr;
+      }
+      return cache[key][i];
+    }
+    case 'Bollinger Bands': {
+      // Returns upper band value; paramA = period (20), stdDev default 2
+      const key = `bb_upper_${period}`;
+      if (!cache[key]) {
+        cache[key] = cache.closes.map((_, j) => {
+          if (j < period - 1) return null;
+          const slice = cache.closes.slice(j - period + 1, j + 1);
+          const mean  = slice.reduce((a, b) => a + b, 0) / period;
+          const std   = Math.sqrt(slice.reduce((s, v) => s + (v - mean) ** 2, 0) / period);
+          return mean + 2 * std;
+        });
+      }
+      return cache[key][i];
+    }
+    case 'Supertrend': {
+      // Simplified: returns 1 if bullish, -1 if bearish (compares to price)
+      // Uses ATR(paramA) with multiplier 3
+      const atrKey = `atr_${period}`;
+      if (!cache[atrKey]) {
+        const atr = new Array(cache.candles.length).fill(null);
+        const trs = cache.candles.map((cn, j) => {
+          if (j === 0) return cn.high - cn.low;
+          const prev = cache.candles[j - 1].close;
+          return Math.max(cn.high - cn.low, Math.abs(cn.high - prev), Math.abs(cn.low - prev));
+        });
+        let sum = 0;
+        for (let j = 0; j < period && j < trs.length; j++) sum += trs[j];
+        if (trs.length >= period) atr[period - 1] = sum / period;
+        for (let j = period; j < trs.length; j++) {
+          atr[j] = (atr[j - 1] * (period - 1) + trs[j]) / period;
+        }
+        cache[atrKey] = atr;
+      }
+      const stKey = `st_${period}`;
+      if (!cache[stKey]) {
+        const st = new Array(cache.candles.length).fill(null);
+        let isBull = true;
+        for (let j = period; j < cache.candles.length; j++) {
+          const cn  = cache.candles[j];
+          const mid = (cn.high + cn.low) / 2;
+          const atrV = cache[atrKey][j];
+          if (atrV == null) continue;
+          const upper = mid + 3 * atrV;
+          const lower = mid - 3 * atrV;
+          if (cn.close > upper) isBull = false;
+          if (cn.close < lower) isBull = true;
+          st[j] = isBull ? 1 : -1;
+        }
+        cache[stKey] = st;
+      }
+      return cache[stKey][i];
+    }
+    case 'CCI': {
+      const key = `cci_${period}`;
+      if (!cache[key]) {
+        cache[key] = cache.candles.map((cn, j) => {
+          if (j < period - 1) return null;
+          const slice = cache.candles.slice(j - period + 1, j + 1);
+          const tps   = slice.map(c => (c.high + c.low + c.close) / 3);
+          const mean  = tps.reduce((a, b) => a + b, 0) / period;
+          const mad   = tps.reduce((s, v) => s + Math.abs(v - mean), 0) / period;
+          const tp    = (cn.high + cn.low + cn.close) / 3;
+          return mad === 0 ? 0 : (tp - mean) / (0.015 * mad);
+        });
+      }
+      return cache[key][i];
+    }
+    case 'ADX': {
+      // Simplified ADX using DX average — returns 0-100
+      const key = `adx_${period}`;
+      if (!cache[key]) {
+        const adx = new Array(cache.candles.length).fill(null);
+        const dxArr = [];
+        for (let j = 1; j < cache.candles.length; j++) {
+          const curr = cache.candles[j], prev = cache.candles[j - 1];
+          const upMove   = curr.high - prev.high;
+          const downMove = prev.low  - curr.low;
+          const plusDM   = (upMove > downMove && upMove > 0) ? upMove : 0;
+          const minusDM  = (downMove > upMove && downMove > 0) ? downMove : 0;
+          const tr = Math.max(curr.high - curr.low, Math.abs(curr.high - prev.close), Math.abs(curr.low - prev.close));
+          const plusDI  = tr > 0 ? 100 * plusDM  / tr : 0;
+          const minusDI = tr > 0 ? 100 * minusDM / tr : 0;
+          const diff = Math.abs(plusDI - minusDI);
+          const sum  = plusDI + minusDI;
+          dxArr.push(sum > 0 ? (diff / sum) * 100 : 0);
+        }
+        let avg = dxArr.slice(0, period).reduce((a, b) => a + b, 0) / period;
+        adx[period] = avg;
+        for (let j = period + 1; j < cache.candles.length; j++) {
+          avg = (avg * (period - 1) + dxArr[j - 1]) / period;
+          adx[j] = avg;
+        }
+        cache[key] = adx;
+      }
+      return cache[key][i];
+    }
     case 'Volume':
       return candle.volume;
     case 'Option Premium':
-      // Approximate ATM call premium as ~2% of close (simplified — real impl
-      // would fetch option chain data, but that requires live data per bar)
       return candle.close * 0.02;
     case 'OI':
     case 'PCR':
     case 'IV / IV Rank':
-    case 'MACD':
-    case 'ADX':
-    case 'ATR':
-    case 'Bollinger Bands':
-    case 'Stochastic':
-      // These indicators are not available in OHLCV-only candle data from Angel One.
-      // Return a neutral value (50) so they don't block the entry signal.
-      // A production implementation would compute them or pull from a data vendor.
+      // Not available in OHLCV data — return neutral so they don't block entry
       return 50;
     default:
       return null;
   }
+}
+
+// ── LHS value resolver — handles lhs_type: 'Price' (OHLC) vs 'Indicator' ─────
+function _lhsValue(cond, cache, i, candle) {
+  if (cond.lhsType === 'Price') {
+    switch (cond.lhsPrice) {
+      case 'Open':   return candle.open;
+      case 'High':   return candle.high;
+      case 'Low':    return candle.low;
+      case 'Volume': return candle.volume;
+      case 'LTP':
+      case 'Close':
+      default:       return candle.close;
+    }
+  }
+  return _indValue(cond.indicator, cond.paramA, cache, i, candle);
 }
 
 // ── Condition evaluator ───────────────────────────────────────────────────────
@@ -355,38 +524,42 @@ function _indValue(indicator, paramA, cache, i, candle) {
  * @param {object}  candle  - current OHLCV candle
  * @returns {boolean}
  */
-function _evalCondition(cond, cache, i, candle) {
-  const lhs = _indValue(cond.indicator, cond.paramA || '14', cache, i, candle);
-  if (lhs === null) return false; // indicator not warmed up yet
+function _evalCondition(rawCond, cache, i, candle) {
+  const cond = _normCond(rawCond); // normalise snake_case → camelCase
 
-  // RHS: either another indicator value or a literal numeric threshold
+  const lhs = _lhsValue(cond, cache, i, candle);
+  if (lhs === null) return false;
+
   let rhs;
-  if (cond.rhs_is_indicator || cond.rhsIsInd) {
-    rhs = _indValue(cond.value_b || cond.valueB || '', cond.paramB || '14', cache, i, candle);
+  if (cond.rhsIsInd) {
+    rhs = _indValue(cond.valueB, cond.rhsPeriod, cache, i, candle);
     if (rhs === null) return false;
   } else {
-    rhs = parseFloat(cond.value_a || cond.valueA || '0') || 0;
+    rhs = parseFloat(cond.valueA) || 0;
   }
 
-  switch (cond.op || cond.operator) {
+  switch (cond.op) {
     case '>':             return lhs >  rhs;
     case '<':             return lhs <  rhs;
     case '>=':            return lhs >= rhs;
     case '<=':            return lhs <= rhs;
-    case '==':            return Math.abs(lhs - rhs) < rhs * 0.001; // ~0.1% tolerance
+    case '==':            return Math.abs(lhs - rhs) < Math.max(0.001, Math.abs(rhs) * 0.001);
     case 'Crosses Above': {
-      // True when lhs crossed above rhs on this bar (was below on previous bar)
-      const prevLhs = _indValue(cond.indicator, cond.paramA || '14', cache, i - 1, cache.candles[i - 1]);
-      const prevRhs = cond.rhs_is_indicator || cond.rhsIsInd
-        ? _indValue(cond.value_b || cond.valueB || '', cond.paramB || '14', cache, i - 1, cache.candles[i - 1])
+      if (i === 0) return false;
+      const prevCond = _normCond(rawCond);
+      const prevLhs  = _lhsValue(prevCond, cache, i - 1, cache.candles[i - 1]);
+      const prevRhs  = cond.rhsIsInd
+        ? _indValue(cond.valueB, cond.rhsPeriod, cache, i - 1, cache.candles[i - 1])
         : rhs;
       if (prevLhs === null || prevRhs === null) return false;
       return prevLhs <= prevRhs && lhs > rhs;
     }
     case 'Crosses Below': {
-      const prevLhs2 = _indValue(cond.indicator, cond.paramA || '14', cache, i - 1, cache.candles[i - 1]);
-      const prevRhs2 = cond.rhs_is_indicator || cond.rhsIsInd
-        ? _indValue(cond.value_b || cond.valueB || '', cond.paramB || '14', cache, i - 1, cache.candles[i - 1])
+      if (i === 0) return false;
+      const prevCond2 = _normCond(rawCond);
+      const prevLhs2  = _lhsValue(prevCond2, cache, i - 1, cache.candles[i - 1]);
+      const prevRhs2  = cond.rhsIsInd
+        ? _indValue(cond.valueB, cond.rhsPeriod, cache, i - 1, cache.candles[i - 1])
         : rhs;
       if (prevLhs2 === null || prevRhs2 === null) return false;
       return prevLhs2 >= prevRhs2 && lhs < rhs;
@@ -432,74 +605,86 @@ function _evalConditions(conds, cache, i, candle) {
 // ── Trade simulation ──────────────────────────────────────────────────────────
 
 /**
- * Simulate a single options strategy trade over a range of candles.
+ * Simulate a single trade over a range of candles.
  *
- * For each strategy leg the approximate option premium is estimated as:
- *   ATM premium ≈ 2% of spot × (1 + |strikeN| × 0.15)
- * This is a simplified model. A production system would query the option
- * chain at entry time to get the real premium.
+ * Options strategy (legs provided): estimates option premium via the simplified
+ *   2%-of-spot model, walks forward bar by bar, exits on SL/target/time.
+ *
+ * Stock / no-legs strategy: simulates a directional equity trade.
+ *   P&L = (exitPrice - entryClose) × shares  (BUY)
+ *   P&L = (entryClose - exitPrice) × shares  (SELL/short)
+ *   shares defaults to 1 if not provided — caller should pass shares from payload.
  *
  * @param {object}   params
- * @param {object[]} params.legs          - array of _Leg objects from Flutter
+ * @param {object[]} params.legs          - option leg objects (empty for stocks)
+ * @param {string}   params.action        - 'BUY' | 'SELL' (for stocks)
+ * @param {number}   params.shares        - number of shares (for stocks)
  * @param {number}   params.entryClose    - spot price at entry bar close
- * @param {number}   params.lotSize       - lot size for the underlying
- * @param {number}   params.slPct         - stop-loss % (e.g. 50 for 50%)
- * @param {number}   params.tgtPct        - target % (e.g. 100 for 100%)
+ * @param {number}   params.lotSize       - lot size for the underlying (options)
+ * @param {number}   params.slPct         - stop-loss % (e.g. 3 for 3%)
+ * @param {number}   params.tgtPct        - target % (e.g. 6 for 6%)
  * @param {object[]} params.futureCandles - remaining candles from entry bar+1
  * @returns {{ pnl: number, exitReason: string }}
  */
-function _simulateTrade({ legs, entryClose, lotSize, slPct, tgtPct, futureCandles }) {
-  // Compute combined net premium at entry
-  let entryPremium = 0;
-  for (const leg of legs) {
-    const n = leg.strike_n ?? leg.strikeN ?? 0;
-    const qty = leg.quantity ?? leg.qty ?? 1;
-    // Approximate ATM premium ≈ 2% of spot; each strike away reduces by 15%
-    const atmPrem = entryClose * 0.02;
-    const legPrem = atmPrem * Math.max(0.05, 1 - Math.abs(n) * 0.15);
-    const sign    = leg.side === 'Buy' ? 1 : -1;
-    entryPremium += sign * legPrem * qty * lotSize;
-  }
+function _simulateTrade({ legs, action = 'BUY', shares = 1, entryClose, lotSize, slPct, tgtPct, futureCandles }) {
+  const isOptions = legs && legs.length > 0;
 
-  // entryPremium > 0 → we paid a net debit (buy dominant)
-  // entryPremium < 0 → we received a net credit (sell dominant)
-  const absEntry = Math.abs(entryPremium);
-  if (absEntry === 0) return { pnl: 0, exitReason: 'no_premium' };
-
-  const slLevel  = slPct  > 0 ? entryPremium - (absEntry * slPct  / 100) : -Infinity;
-  const tgtLevel = tgtPct > 0 ? entryPremium + (absEntry * tgtPct / 100) :  Infinity;
-
-  // Walk forward candle by candle, updating estimated premium based on spot change
-  for (const c of futureCandles) {
-    const spotChange = (c.close - entryClose) / entryClose; // fractional
-
-    let currentPnl = 0;
+  if (isOptions) {
+    // ── Options: premium-based simulation ──────────────────────────────────
+    let entryPremium = 0;
     for (const leg of legs) {
       const n   = leg.strike_n ?? leg.strikeN ?? 0;
       const qty = leg.quantity ?? leg.qty ?? 1;
-      const atmPrem    = c.close * 0.02;
-      const legPrem    = atmPrem * Math.max(0.05, 1 - Math.abs(n) * 0.15);
-      const sign       = leg.side === 'Buy' ? 1 : -1;
-      currentPnl += sign * legPrem * qty * lotSize;
+      const atmPrem = entryClose * 0.02;
+      const legPrem = atmPrem * Math.max(0.05, 1 - Math.abs(n) * 0.15);
+      const sign    = leg.side === 'Buy' ? 1 : -1;
+      entryPremium += sign * legPrem * qty * lotSize;
     }
 
-    const mtmPnl = currentPnl - entryPremium;
+    const absEntry = Math.abs(entryPremium);
+    if (absEntry === 0) return { pnl: 0, exitReason: 'no_premium' };
 
-    if (tgtPct > 0 && mtmPnl >= absEntry * tgtPct / 100) {
-      return { pnl: mtmPnl, exitReason: 'target' };
+    for (const c of futureCandles) {
+      let currentPnl = 0;
+      for (const leg of legs) {
+        const n   = leg.strike_n ?? leg.strikeN ?? 0;
+        const qty = leg.quantity ?? leg.qty ?? 1;
+        const atmPrem = c.close * 0.02;
+        const legPrem = atmPrem * Math.max(0.05, 1 - Math.abs(n) * 0.15);
+        const sign    = leg.side === 'Buy' ? 1 : -1;
+        currentPnl += sign * legPrem * qty * lotSize;
+      }
+      const mtmPnl = currentPnl - entryPremium;
+      if (tgtPct > 0 && mtmPnl >= absEntry * tgtPct / 100) return { pnl: mtmPnl, exitReason: 'target' };
+      if (slPct  > 0 && mtmPnl <= -(absEntry * slPct / 100))  return { pnl: mtmPnl, exitReason: 'stoploss' };
     }
-    if (slPct > 0 && mtmPnl <= -(absEntry * slPct / 100)) {
-      return { pnl: mtmPnl, exitReason: 'stoploss' };
+
+    const lastChange = futureCandles.length > 0
+      ? (futureCandles[futureCandles.length - 1].close - entryClose) / entryClose
+      : 0;
+    return { pnl: entryPremium * lastChange, exitReason: 'end_of_data' };
+
+  } else {
+    // ── Stocks / index futures: price-change simulation ─────────────────────
+    const isBuy  = action.toUpperCase() !== 'SELL';
+    const slAbs  = slPct  > 0 ? entryClose * (slPct  / 100) : Infinity;
+    const tgtAbs = tgtPct > 0 ? entryClose * (tgtPct / 100) : Infinity;
+
+    for (const c of futureCandles) {
+      const priceDiff = c.close - entryClose;
+      const move      = isBuy ? priceDiff : -priceDiff;
+
+      if (move >=  tgtAbs) return { pnl:  tgtAbs * shares, exitReason: 'target' };
+      if (move <= -slAbs)  return { pnl: -slAbs  * shares, exitReason: 'stoploss' };
     }
+
+    // No exit hit — close at last candle price
+    const lastClose = futureCandles.length > 0
+      ? futureCandles[futureCandles.length - 1].close
+      : entryClose;
+    const finalMove = isBuy ? lastClose - entryClose : entryClose - lastClose;
+    return { pnl: finalMove * shares, exitReason: 'end_of_data' };
   }
-
-  // No SL/target hit → exit at last candle
-  const lastSpotChange = futureCandles.length > 0
-    ? (futureCandles[futureCandles.length - 1].close - entryClose) / entryClose
-    : 0;
-
-  const exitPnl = entryPremium * lastSpotChange;
-  return { pnl: exitPnl, exitReason: 'end_of_data' };
 }
 
 // ── Main backtest runner ──────────────────────────────────────────────────────
@@ -539,6 +724,9 @@ async function runBacktest(params) {
     legs        = [],
     slPct       = '50',
     tgtPct      = '100',
+    range       = '3 Months', // user-selected lookback period
+    action      = 'BUY',      // stock direction: 'BUY' | 'SELL'
+    shares      = 10,         // number of shares for stock backtests
   } = params;
 
   const interval = TF_MAP[timeframe] || 'FIFTEEN_MINUTE';
@@ -547,9 +735,7 @@ async function runBacktest(params) {
   const tgt      = parseFloat(tgtPct) || 100;
 
   // ── Fetch candles ──────────────────────────────────────────────────────────
-  const candles = await _fetchCandles(underlying, interval);
-
-  if (candles.length < 50) {
+  const candles = await _fetchCandles(underlying, interval, range);  if (candles.length < 50) {
     throw new Error(`Insufficient candle data: only ${candles.length} bars returned`);
   }
 
@@ -601,7 +787,7 @@ async function runBacktest(params) {
       // Check SL / target via trade simulation on the bars after entry
       const futureCandles = candles.slice(entryBar + 1, i + 1);
       const { pnl, exitReason } = _simulateTrade({
-        legs, entryClose, lotSize, slPct: sl, tgtPct: tgt, futureCandles,
+        legs, action, shares, entryClose, lotSize, slPct: sl, tgtPct: tgt, futureCandles,
       });
 
       const shouldExit =
