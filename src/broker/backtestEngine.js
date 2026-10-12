@@ -101,10 +101,13 @@ function _dateRange(interval, range = '3 Months') {
   };
   const requestedDays = RANGE_DAYS[range.toLowerCase()] ?? 90;
 
-  // For daily/hourly intervals enforce a minimum so EMA(50) has enough bars
+  // For daily/hourly intervals enforce a minimum so EMA(50) has enough bars.
+  // EMA(50) needs 50 bars to init + warmup + enough bars to trade.
+  // ONE_DAY: force minimum 400 calendar days (~280 trading days) so even
+  // "1 Month" period selection still produces meaningful backtest results.
   const MIN_DAYS = {
-    'ONE_DAY':  180,  // ~126 trading days — enough for EMA(50) + warmup
-    'ONE_HOUR': 90,
+    'ONE_DAY':  400,  // ~280 trading days — comfortable for EMA(50/200) + trades
+    'ONE_HOUR': 120,  // ~84 trading days
   };
   const minDays = MIN_DAYS[interval] ?? 0;
 
