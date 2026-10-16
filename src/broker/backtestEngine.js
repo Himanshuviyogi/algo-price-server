@@ -357,6 +357,7 @@ function _normCond(c) {
     paramC:    c.param_c         || c.paramC          || '9',
     candleSrc: c.candle_src      || c.candleSrc       || 'Current Candle',
     op:        c.operator        || c.op              || '>',
+    rhsNone:   c.rhs_none        != null ? c.rhs_none  : (c.rhsNone  || false),
     rhsIsInd:  c.rhs_is_indicator != null ? c.rhs_is_indicator : (c.rhsIsInd || false),
     valueA:    c.value_a         || c.valueA          || '0',
     valueB:    c.value_b         || c.valueB          || '',
@@ -578,6 +579,17 @@ function _evalCondition(rawCond, cache, i, candle) {
 
   const lhs = _lhsValue(cond, cache, i, candle);
   if (lhs === null) return false;
+
+  // rhsNone: signal-only — evaluate direction/positivity of the indicator
+  if (cond.rhsNone) {
+    switch (cond.indicator) {
+      case 'Supertrend': return lhs === 1;   // 1=bullish, -1=bearish
+      case 'MACD':       return lhs > 0;     // above zero line
+      case 'ADX':        return lhs > 25;    // strong trend
+      case 'Volume':     return lhs > 0;
+      default:           return lhs > 0;
+    }
+  }
 
   let rhs;
   if (cond.rhsIsInd) {
