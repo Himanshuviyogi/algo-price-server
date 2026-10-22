@@ -203,7 +203,12 @@ async function _fetchCandles(underlying, interval, range = '3 Months') {
 
   console.log(`[Backtest] Fetching ${interval} candles for ${underlying} (${fromdate} → ${todate})`);
 
-  const res = await axios.post(
+  /**
+   * Helper: make the candle API request with the given token.
+   * Returns the axios response. Never throws on 4xx — uses validateStatus
+   * so we can inspect the body and decide whether to re-login.
+   */
+  const _candleRequest = (token) => axios.post(
     `${ANGEL_BASE}/rest/secure/angelbroking/historical/v1/getCandleData`,
     {
       exchange:    inst.exchange,
@@ -216,7 +221,7 @@ async function _fetchCandles(underlying, interval, range = '3 Months') {
       headers: {
         'Content-Type':     'application/json',
         'Accept':           'application/json',
-        'Authorization':    `Bearer ${authToken}`,
+        'Authorization':    `Bearer ${token}`,
         'X-UserType':       'USER',
         'X-SourceID':       'WEB',
         'X-ClientLocalIP':  '127.0.0.1',
@@ -224,12 +229,33 @@ async function _fetchCandles(underlying, interval, range = '3 Months') {
         'X-MACAddress':     '00:00:00:00:00:00',
         'X-PrivateKey':     config.angel.apiKey,
       },
-      timeout: 30_000,
+      timeout:        30_000,
+      // Don't throw on 4xx — let us inspect the body for auth errors
+      validateStatus: () => true,
     }
   );
 
-  if (!res.data?.status) {
-    const msg = res.data?.message || JSON.stringify(res.data);
+  let res = await _candleRequest(authToken);
+
+  // Angel One returns 403 (or status:false with "invalid token") when the
+  // session JWT has expired. The in-memory token is stale — re-login once
+  // and retry before giving up.
+  const _isAuthError = (r) => {
+    if (r.status === 401 || r.status === 403) return true;
+    const msg = (r.data?.message || '').toLowerCase();
+    return msg.includes('invalid token') || msg.includes('unauthorized') ||
+           msg.includes('not logged in') || msg.includes('access denied');
+  };
+
+  if (_isAuthError(res)) {
+    console.warn(`[Backtest] Angel One auth error (HTTP ${res.status}) — re-logging in and retrying...`);
+    const session = await angelOne.login();
+    authToken = session.authToken;
+    res = await _candleRequest(authToken);
+  }
+
+  if (res.status < 200 || res.status >= 300 || !res.data?.status) {
+    const msg = res.data?.message || `HTTP ${res.status}`;
     throw new Error(`Angel One candle API error: ${msg}`);
   }
 
