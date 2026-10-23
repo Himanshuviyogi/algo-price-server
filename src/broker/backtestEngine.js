@@ -251,6 +251,10 @@ async function _fetchCandles(underlying, interval, range = '3 Months') {
     console.warn(`[Backtest] Angel One auth error (HTTP ${res.status}) — re-logging in and retrying...`);
     const session = await angelOne.login();
     authToken = session.authToken;
+    // Give Angel One 1.5 s to propagate the new session before retrying —
+    // hammering the candle API immediately after re-login can produce another
+    // 403 even with a fresh valid token (rate-limit / session propagation lag).
+    await new Promise(r => setTimeout(r, 1500));
     res = await _candleRequest(authToken);
   }
 
