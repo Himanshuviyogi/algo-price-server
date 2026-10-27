@@ -65,6 +65,61 @@ if (fs.existsSync(adminDist)) {
   console.log('[Server] Admin panel not found at', adminDist, '— run deploy-admin.sh to build it');
 }
 
+// ── Auth middleware ───────────────────────────────────────────────────────────
+// requireAuth: verifies Bearer token and optionally confirms the uid in the
+// token matches the userId in the request body or :userId path param.
+//
+// Two accepted auth paths:
+//   1. Firebase Bearer token (from Flutter app users)
+//   2. PRICE_SERVER_SECRET header (from Cloud Functions server-to-server calls)
+//
+// Modes:
+//   'body'  — uid in token must match req.body.userId
+//   'param' — uid in token must match req.params.userId
+//   'admin' — requires admin custom claim (or service secret)
+
+const SERVICE_SECRET = process.env.PRICE_SERVER_SECRET || '';
+
+function requireAuth(mode = 'body') {
+  return async (req, res, next) => {
+    // Service-to-service: Cloud Functions pass the shared secret
+    const serviceHeader = req.headers['x-service-secret'];
+    if (SERVICE_SECRET && serviceHeader === SERVICE_SECRET) {
+      req.callerUid = 'service';
+      return next();
+    }
+
+    const authHeader = req.headers.authorization || '';
+    const idToken = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : null;
+    if (!idToken) {
+      return res.status(401).json({ success: false, error: 'Authorization token required' });
+    }
+    let decoded;
+    try {
+      decoded = await verifyToken(idToken);
+    } catch (err) {
+      return res.status(401).json({ success: false, error: 'Invalid or expired token' });
+    }
+    // Admin-only endpoints check for custom claim
+    if (mode === 'admin') {
+      if (!decoded.admin) {
+        return res.status(403).json({ success: false, error: 'Admin access required' });
+      }
+      req.callerUid = decoded.uid;
+      return next();
+    }
+    // For body/param modes, confirm the uid in the token matches the request userId
+    const requestUid = mode === 'param'
+      ? req.params.userId
+      : (req.body.userId ?? req.body.uid);
+    if (requestUid && decoded.uid !== requestUid) {
+      return res.status(403).json({ success: false, error: 'Forbidden — uid mismatch' });
+    }
+    req.callerUid = decoded.uid;
+    next();
+  };
+}
+
 // Health check endpoint (Railway uses this)
 app.get('/health', (req, res) => {
   res.json({
@@ -104,7 +159,7 @@ app.get('/price/:symbol', (req, res) => {
 
 // Reload symbols from Firestore without restarting the server
 // POST /reload-symbols — call this from admin panel after updating tokens
-app.post('/reload-symbols', async (req, res) => {
+app.post('/reload-symbols', requireAuth('admin'), async (req, res) => {
   try {
     const tokens = await loadFromFirestore();
     const symbols = Object.keys(tokens);
@@ -566,7 +621,7 @@ const orderExecutor = require('./broker/orderExecutor');
 
 // POST /place-order
 // Body: { userId, symbol, exchange, action, orderType, quantity, price, triggerPrice, signalId }
-app.post('/place-order', async (req, res) => {
+app.post('/place-order', requireAuth(), async (req, res) => {
   try {
     const {
       userId, symbol, exchange, action, orderType,
@@ -596,7 +651,7 @@ app.post('/place-order', async (req, res) => {
 
 // POST /cancel-order
 // Body: { angelOrderId, userId }
-app.post('/cancel-order', async (req, res) => {
+app.post('/cancel-order', requireAuth(), async (req, res) => {
   try {
     const { angelOrderId, userId } = req.body;
 
@@ -614,7 +669,7 @@ app.post('/cancel-order', async (req, res) => {
 
 // POST /modify-order
 // Body: { angelOrderId, orderType, quantity, price, triggerPrice, userId }
-app.post('/modify-order', async (req, res) => {
+app.post('/modify-order', requireAuth(), async (req, res) => {
   try {
     const { angelOrderId, orderType, quantity, price, triggerPrice = 0, userId } = req.body;
 
@@ -637,7 +692,7 @@ app.post('/modify-order', async (req, res) => {
 });
 
 // GET /order-book/:userId — sync from Angel One then return all Firestore orders for user
-app.get('/order-book/:userId', async (req, res) => {
+app.get('/order-book/:userId', requireAuth('param'), async (req, res) => {
   try {
     const { userId } = req.params;
 
@@ -672,7 +727,7 @@ app.get('/order-book/:userId', async (req, res) => {
 const positionManager = require('./broker/positionManager');
 
 // POST /sync-positions/:userId — fetch from Angel One, upsert to Firestore
-app.post('/sync-positions/:userId', async (req, res) => {
+app.post('/sync-positions/:userId', requireAuth('param'), async (req, res) => {
   try {
     const { userId } = req.params;
 
@@ -690,7 +745,7 @@ app.post('/sync-positions/:userId', async (req, res) => {
 
 // POST /close-position
 // Body: { positionId, userId }
-app.post('/close-position', async (req, res) => {
+app.post('/close-position', requireAuth(), async (req, res) => {
   try {
     const { positionId, userId } = req.body;
 
@@ -716,7 +771,7 @@ app.post('/close-position', async (req, res) => {
 // /sync-positions/:userId for the actual Angel One fetch; this endpoint is
 // the lightweight read-only counterpart.
 
-app.get('/positions/:userId', async (req, res) => {
+app.get('/positions/:userId', requireAuth('param'), async (req, res) => {
   try {
     const { userId } = req.params;
     if (!userId) {
@@ -866,7 +921,7 @@ app.post('/broker/verify', async (req, res) => {
   }
 });
 
-app.post('/start-broker', async (req, res) => {
+app.post('/start-broker', requireAuth('admin'), async (req, res) => {
   if (angelOne.isConnected()) {
     return res.json({ success: true, message: 'Broker already connected' });
   }
@@ -879,7 +934,7 @@ app.post('/start-broker', async (req, res) => {
   }
 });
 
-app.post('/stop-broker', (req, res) => {
+app.post('/stop-broker', requireAuth('admin'), (req, res) => {
   if (!angelOne.isConnected()) {
     return res.json({ success: true, message: 'Broker already disconnected' });
   }
