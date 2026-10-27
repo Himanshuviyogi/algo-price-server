@@ -56,12 +56,14 @@ const INDEX_TOKENS = {
 };
 
 // Default lot sizes per underlying
+// Default lot sizes per underlying — effective October 28, 2025 (NSE/BSE revised)
+// Source: https://www.5paisa.com/news/nse-reduces-fo-lot-sizes-for-nifty-50-and-key-indices-from-october-28
 const LOT_SIZES = {
-  NIFTY:      50,
-  BANKNIFTY:  15,
-  FINNIFTY:   40,
-  MIDCPNIFTY: 75,
-  SENSEX:     10,
+  NIFTY:      65,
+  BANKNIFTY:  30,
+  FINNIFTY:   60,
+  MIDCPNIFTY: 120,
+  SENSEX:     20,
 };
 
 // ── Date helpers ──────────────────────────────────────────────────────────────
@@ -841,7 +843,7 @@ async function runBacktest(params) {
   } = params;
 
   const interval = TF_MAP[timeframe] || 'FIFTEEN_MINUTE';
-  const lotSize  = LOT_SIZES[underlying.toUpperCase()] ?? 50;
+  const lotSize  = LOT_SIZES[underlying.toUpperCase()] ?? 65;
   const sl       = parseFloat(slPct)  || 50;
   const tgt      = parseFloat(tgtPct) || 100;
 
