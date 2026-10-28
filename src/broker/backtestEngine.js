@@ -170,16 +170,20 @@ async function _fetchCandles(underlying, interval, range = '3 Months') {
   }
 
   if (!inst) {
-    // Last resort — scan Angel One ScripMaster for an exact NSE EQ match
+    // Last resort — scan Angel One ScripMaster for an NSE EQ match.
+    // Angel One stores equity symbols with a "-EQ" suffix (e.g. "TATACONSUM-EQ")
+    // so we match both the raw symbol AND the symbol with "-EQ" appended.
     try {
-      const master   = await loadScripMaster();
-      const match    = master.find(
-        r => r.symbol && r.symbol.toUpperCase() === sym && r.exch_seg === 'NSE' &&
-             (!r.instrumenttype || r.instrumenttype === '' || r.instrumenttype === 'EQ')
-      );
+      const master = await loadScripMaster();
+      const match  = master.find(r => {
+        if (r.exch_seg !== 'NSE') return false;
+        if (r.instrumenttype && r.instrumenttype !== '' && r.instrumenttype !== 'EQ') return false;
+        const s = (r.symbol || '').toUpperCase();
+        return s === sym || s === `${sym}-EQ`;
+      });
       if (match) {
         inst = { token: String(match.token), exchange: 'NSE' };
-        console.log(`[Backtest] Resolved ${sym} → token ${inst.token} via ScripMaster`);
+        console.log(`[Backtest] Resolved ${sym} → token ${inst.token} via ScripMaster (symbol=${match.symbol})`);
       }
     } catch (smErr) {
       console.warn('[Backtest] ScripMaster lookup failed:', smErr.message);
